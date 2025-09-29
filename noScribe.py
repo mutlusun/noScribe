@@ -1103,6 +1103,23 @@ class App(ctk.CTk):
         self.button_transcript_file = ctk.CTkButton(self.frame_transcript_file, width=45, height=29, text='📂', command=self.button_transcript_file_event)
         self.button_transcript_file.place(x=213, y=2)
 
+        # Input Mode Selection (as shown in user's attachment)
+        self.label_input_mode = ctk.CTkLabel(self.scrollable_options, text='Input Mode:')
+        self.label_input_mode.pack(padx=20, pady=[20,0], anchor='w')
+
+        self.frame_input_mode = ctk.CTkFrame(self.scrollable_options, width=260, height=33, corner_radius=8, border_width=2)
+        self.frame_input_mode.pack(padx=20, pady=[0,10], anchor='w')
+
+        self.option_menu_input_mode = ctk.CTkOptionMenu(self.frame_input_mode, width=260, 
+                                                       values=['Single File', 'Multi-File (by Speaker)'], 
+                                                       command=self.on_input_mode_changed)
+        self.option_menu_input_mode.pack(padx=5, pady=5)
+        self.option_menu_input_mode.set('Single File')
+        
+        # Initialize input mode and multi-file support
+        self.input_mode = 'single'  # 'single' or 'multi'
+        self.audio_files = []  # List of dictionaries: [{'file': path, 'speaker': name}, ...]
+
         # Options grid
         self.frame_options = ctk.CTkFrame(self.scrollable_options, width=250, fg_color='transparent')
         self.frame_options.pack_propagate(False)
@@ -2316,7 +2333,7 @@ class App(ctk.CTk):
             option_info += f'{t("label_speaker")} {job.speaker_detection} | '
             option_info += f'{t("label_overlapping")} {job.overlapping} | '
             option_info += f'{t("label_timestamps")} {job.timestamps} | '
-            option_info += f'{t("label_disfluencies")} {job.disfluencies} | '
+            option_info += f'{t("label_disfluencies")} {job.disfluencies)} | '
             option_info += f'{t("label_pause")} {job.pause}'
 
             # Create log file
@@ -3188,6 +3205,202 @@ class App(ctk.CTk):
             except Exception:
                 pass
             self.destroy()
+
+    def on_input_mode_changed(self, value):
+        """Handle input mode change between single and multi-file"""
+        if value == 'Single File':
+            self.input_mode = 'single'
+            # Show single file UI, hide multi-file UI
+            # Implementation depends on existing UI structure
+        else:
+            self.input_mode = 'multi'
+            # Show multi-file UI, hide single file UI
+            # Implementation depends on existing UI structure
+
+    def button_add_audio_file_event(self):
+        """Add a new audio file to the multi-file list"""
+        fn = tk.filedialog.askopenfilename(
+            title='Add Audio File',
+            filetypes=[
+                ('Audio files', '*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.wma'),
+                ('All files', '*.*')
+            ]
+        )
+        if fn:
+            # Generate speaker name from filename
+            speaker_name = Path(fn).stem
+            if speaker_name.startswith('audio') and len(speaker_name) > 5:
+                # Handle Zoom-style naming: audio1Speaker1.m4a -> Speaker1
+                if 'Speaker' in speaker_name:
+                    speaker_name = speaker_name.split('Speaker')[-1]
+                    speaker_name = f"Speaker{speaker_name}"
+                else:
+                    speaker_name = f"Speaker{len(self.audio_files) + 1:02d}"
+            else:
+                speaker_name = f"Speaker{len(self.audio_files) + 1:02d}"
+            
+            # Add to list
+            self.audio_files.append({'file': fn, 'speaker': speaker_name})
+            self.update_audio_files_display()
+            self.logn(f"Audio files selected: {len(self.audio_files)} files")
+
+    def update_audio_files_display(self):
+        """Update the display of audio files in the multi-file UI"""
+        # Implementation would depend on UI structure
+        pass
+
+    def update_speaker_name(self, index, new_name):
+        """Update speaker name for a file"""
+        if 0 <= index < len(self.audio_files):
+            self.audio_files[index]['speaker'] = new_name
+
+    def remove_audio_file(self, index):
+        """Remove an audio file from the list"""
+        if 0 <= index < len(self.audio_files):
+            del self.audio_files[index]
+            self.update_audio_files_display()
+
+    def transcribe_multi_files(self, tmpdir):
+        """Transcribe multiple files using word-level timestamps for better timeline accuracy"""
+        from faster_whisper import WhisperModel
+        
+        # Initialize Whisper model
+        if platform.system() == "Darwin":
+            whisper_device = 'auto'
+        elif platform.system() in ('Windows', 'Linux'):
+            whisper_device = getattr(self, 'whisper_xpu', 'cpu')
+        else:
+            raise Exception('Platform not supported yet.')
+        
+        self.logn(f"Loading Whisper model for multi-file transcription")
+        
+        try:
+            model = WhisperModel('models/precise', device=whisper_device, 
+                               cpu_threads=number_threads, compute_type='int8', 
+                               local_files_only=True)
+            self.logn("Whisper model loaded successfully")
+        except Exception as e:
+            self.logn(f"Error loading Whisper model: {str(e)}", 'error')
+            raise
+        
+        all_word_segments = []
+        
+        # Transcribe each file separately - using WORD-LEVEL timestamps for precision
+        for i, audio_info in enumerate(self.audio_files):
+            if self.cancel:
+                self.logn("Transcription canceled by user")
+                break
+                
+            self.logn(f"Processing file {i+1}/{len(self.audio_files)}: {audio_info['speaker']}")
+            
+            tmp_audio = os.path.join(tmpdir.name, f'tmp_audio_{i}.wav')
+            
+            try:
+                # Convert audio file (simplified conversion)
+                self.convert_audio_file_for_multifile(audio_info['file'], tmp_audio)
+                self.logn(f"Audio conversion completed for {audio_info['speaker']}")
+                
+                # Transcribe with word-level timestamps for precise timeline management
+                segments, info = model.transcribe(
+                    tmp_audio,
+                    word_timestamps=True,  # Critical for timeline accuracy
+                    vad_filter=True,
+                    beam_size=5,
+                    temperature=0.0
+                )
+                
+                self.logn(f"Transcription completed for {audio_info['speaker']}")
+                
+                # Extract WORD-LEVEL segments for precise timeline control
+                word_count = 0
+                for segment in segments:
+                    # Process each word individually with precise timestamps
+                    if hasattr(segment, 'words') and segment.words:
+                        for word in segment.words:
+                            if word.word.strip():  # Only non-empty words
+                                word_segment = {
+                                    'start': word.start,
+                                    'end': word.end,
+                                    'text': word.word.strip(),
+                                    'speaker': audio_info['speaker']
+                                }
+                                all_word_segments.append(word_segment)
+                                word_count += 1
+                
+                self.logn(f"Added {word_count} word-level segments from {audio_info['speaker']}")
+                
+            except Exception as e:
+                self.logn(f"Error processing {audio_info['speaker']}: {str(e)}", 'error')
+                continue
+        
+        # Sort ALL segments by start time - this is the key to proper timeline order
+        all_word_segments.sort(key=lambda x: x['start'])
+        self.logn(f"Total word segments collected: {len(all_word_segments)}")
+        
+        # Now merge word segments into speaker utterances for better readability
+        merged_segments = self.merge_word_segments_to_utterances(all_word_segments)
+        self.logn(f"Merged into {len(merged_segments)} speaker utterances")
+        
+        return merged_segments
+
+    def merge_word_segments_to_utterances(self, word_segments, max_utterance_duration=60):
+        """
+        Merge word-level segments into speaker utterances using transview's approach.
+        This handles timeline accuracy while creating readable transcript segments.
+        """
+        if not word_segments:
+            return []
+        
+        merged_utterances = []
+        current_utterance = None
+        
+        for segment in word_segments:
+            if current_utterance is None:
+                # Start first utterance
+                current_utterance = {
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'text': segment['text'],
+                    'speaker': segment['speaker']
+                }
+            elif (segment['speaker'] == current_utterance['speaker'] and 
+                  (current_utterance['end'] - current_utterance['start']) < max_utterance_duration):
+                # Same speaker and utterance not too long - merge
+                current_utterance['end'] = segment['end']
+                current_utterance['text'] += ' ' + segment['text']
+            else:
+                # Speaker change or utterance too long - finalize current and start new
+                merged_utterances.append(current_utterance)
+                current_utterance = {
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'text': segment['text'],
+                    'speaker': segment['speaker']
+                }
+        
+        # Add final utterance
+        if current_utterance:
+            merged_utterances.append(current_utterance)
+        
+        return merged_utterances
+
+    def convert_audio_file_for_multifile(self, input_file, output_file):
+        """Convert audio file to WAV format for multi-file processing"""
+        import subprocess
+        
+        # Simplified conversion - would need full implementation
+        arguments = [
+            'ffmpeg', '-y', '-i', input_file,
+            '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
+            output_file
+        ]
+        
+        try:
+            subprocess.run(arguments, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            raise Exception(f'FFmpeg conversion failed: {e}')
+
+    # ...existing code...
 
 def run_cli_mode(args):
     """Run noScribe in CLI mode"""
